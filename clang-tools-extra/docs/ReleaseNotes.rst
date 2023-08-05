@@ -141,6 +141,11 @@ New checks
 
   Replace ``enable_if`` with C++20 requires clauses.
 
+- New :doc:`modernize-use-range-insert
+  <clang-tidy/checks/modernize/use-range-insert>` check.
+
+  FIXME: add release notes.
+
 - New :doc:`performance-enum-size
   <clang-tidy/checks/performance/enum-size>` check.
 
