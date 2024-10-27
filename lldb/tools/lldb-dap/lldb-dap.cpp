@@ -11,6 +11,7 @@
 #include "RunInTerminal.h"
 #include "Watchpoint.h"
 #include "lldb/API/SBDeclaration.h"
+#include "lldb/API/SBError.h"
 #include "lldb/API/SBInstruction.h"
 #include "lldb/API/SBListener.h"
 #include "lldb/API/SBMemoryRegionInfo.h"
@@ -4150,21 +4151,14 @@ void request_variables(const llvm::json::Object &request) {
 //     }
 //   }]
 // },
-void request_locations(const llvm::json::Object &request) {
-  llvm::json::Object response;
-  FillResponse(request, response);
-  auto *arguments = request.getObject("arguments");
-
+RequestCallbackResult request_locations(const llvm::json::Object *arguments) {
   uint64_t location_id = GetUnsigned(arguments, "locationReference", 0);
   // We use the lowest bit to distinguish between value location and declaration
   // location
   auto [var_ref, is_value_location] = UnpackLocation(location_id);
   lldb::SBValue variable = g_dap.variables.GetVariable(var_ref);
   if (!variable.IsValid()) {
-    response["success"] = false;
-    response["message"] = "Invalid variable reference";
-    g_dap.SendJSON(llvm::json::Value(std::move(response)));
-    return;
+    return lldb::SBError("Invalid variable reference");
   }
 
   llvm::json::Object body;
@@ -4172,11 +4166,8 @@ void request_locations(const llvm::json::Object &request) {
     // Get the value location
     if (!variable.GetType().IsPointerType() &&
         !variable.GetType().IsReferenceType()) {
-      response["success"] = false;
-      response["message"] =
-          "Value locations are only available for pointers and references";
-      g_dap.SendJSON(llvm::json::Value(std::move(response)));
-      return;
+      return lldb::SBError(
+          "Value locations are only available for pointers and references");
     }
 
     lldb::addr_t addr = variable.GetValueAsAddress();
@@ -4184,10 +4175,7 @@ void request_locations(const llvm::json::Object &request) {
         g_dap.target.ResolveLoadAddress(addr).GetLineEntry();
 
     if (!line_entry.IsValid()) {
-      response["success"] = false;
-      response["message"] = "Failed to resolve line entry for location";
-      g_dap.SendJSON(llvm::json::Value(std::move(response)));
-      return;
+      return lldb::SBError("Failed to resolve line entry for location");
     }
 
     body.try_emplace("source", CreateSource(line_entry.GetFileSpec()));
@@ -4199,10 +4187,7 @@ void request_locations(const llvm::json::Object &request) {
     // Get the declaration location
     lldb::SBDeclaration decl = variable.GetDeclaration();
     if (!decl.IsValid()) {
-      response["success"] = false;
-      response["message"] = "No declaration location available";
-      g_dap.SendJSON(llvm::json::Value(std::move(response)));
-      return;
+      return lldb::SBError("No declaration location available");
     }
 
     body.try_emplace("source", CreateSource(decl.GetFileSpec()));
@@ -4212,8 +4197,7 @@ void request_locations(const llvm::json::Object &request) {
       body.try_emplace("column", column);
   }
 
-  response.try_emplace("body", std::move(body));
-  g_dap.SendJSON(llvm::json::Value(std::move(response)));
+  return body;
 }
 
 // "DisassembleRequest": {
@@ -4288,29 +4272,19 @@ void request_locations(const llvm::json::Object &request) {
 //     }
 //   }]
 // }
-void request_disassemble(const llvm::json::Object &request) {
-  llvm::json::Object response;
-  FillResponse(request, response);
-  auto *arguments = request.getObject("arguments");
-
+RequestCallbackResult request_disassemble(const llvm::json::Object *arguments) {
   llvm::StringRef memoryReference = GetString(arguments, "memoryReference");
   auto addr_opt = DecodeMemoryReference(memoryReference);
   if (!addr_opt.has_value()) {
-    response["success"] = false;
-    response["message"] =
-        "Malformed memory reference: " + memoryReference.str();
-    g_dap.SendJSON(llvm::json::Value(std::move(response)));
-    return;
+    return lldb::SBError("Malformed memory reference: " +
+                         memoryReference.str());
   }
   lldb::addr_t addr_ptr = *addr_opt;
 
   addr_ptr += GetSigned(arguments, "instructionOffset", 0);
   lldb::SBAddress addr(addr_ptr, g_dap.target);
   if (!addr.IsValid()) {
-    response["success"] = false;
-    response["message"] = "Memory reference not found in the current binary.";
-    g_dap.SendJSON(llvm::json::Value(std::move(response)));
-    return;
+    return lldb::SBError("Memory reference not found in the current binary.");
   }
 
   const auto inst_count = GetUnsigned(arguments, "instructionCount", 0);
@@ -4318,10 +4292,7 @@ void request_disassemble(const llvm::json::Object &request) {
       g_dap.target.ReadInstructions(addr, inst_count);
 
   if (!insts.IsValid()) {
-    response["success"] = false;
-    response["message"] = "Failed to find instructions for memory address.";
-    g_dap.SendJSON(llvm::json::Value(std::move(response)));
-    return;
+    return lldb::SBError("Failed to find instructions for memory address.");
   }
 
   const bool resolveSymbols = GetBoolean(arguments, "resolveSymbols", false);
@@ -4417,8 +4388,7 @@ void request_disassemble(const llvm::json::Object &request) {
 
   llvm::json::Object body;
   body.try_emplace("instructions", std::move(instructions));
-  response.try_emplace("body", std::move(body));
-  g_dap.SendJSON(llvm::json::Value(std::move(response)));
+  return body;
 }
 
 // "ReadMemoryRequest": {

@@ -691,17 +691,7 @@ PacketStatus DAP::GetNextObject(llvm::json::Object &object) {
 bool DAP::HandleObject(const llvm::json::Object &object) {
   const auto packet_type = GetString(object, "type");
   if (packet_type == "request") {
-    const auto command = GetString(object, "command");
-    auto handler_pos = request_handlers.find(std::string(command));
-    if (handler_pos != request_handlers.end()) {
-      handler_pos->second(object);
-      return true; // Success
-    } else {
-      if (log)
-        *log << "error: unhandled command \"" << command.data() << "\""
-             << std::endl;
-      return false; // Fail
-    }
+    return HandleRequest(object);
   }
 
   if (packet_type == "response") {
@@ -739,6 +729,50 @@ bool DAP::HandleObject(const llvm::json::Object &object) {
   }
 
   return false;
+}
+
+bool DAP::HandleRequest(const llvm::json::Object &request) {
+  const auto command = GetString(request, "command");
+  auto handler_pos = request_handlers.find(std::string(command));
+  if (handler_pos == request_handlers.end()) {
+    if (log)
+      *log << "error: unhandled command \"" << command.data() << "\""
+           << std::endl;
+    return false; // Fail
+  }
+
+  // XXX double-check if there actually is any request which does not require arguments
+  const llvm::json::Object *arguments = request.getObject("arguments");
+  std::variant<llvm::json::Object, lldb::SBError> result =
+      handler_pos->second(arguments);
+
+  llvm::json::Object response;
+  response.try_emplace("type", "response");
+  EmplaceSafeString(response, "command", command);
+  const int64_t seq = GetSigned(request, "seq", 0);
+  response.try_emplace("request_seq", seq);
+  if (auto *result_obj = std::get_if<llvm::json::Object>(&result)) {
+    response.try_emplace("success", false);
+    response.try_emplace("body", std::move(*result_obj));
+  } else {
+    auto &error = std::get<lldb::SBError>(result);
+    bool failed = error.Fail();
+    response.try_emplace("success", !failed);
+    if (failed) {
+      llvm::json::Object error_json;
+      error_json.try_emplace("id", 0); // We don't have error ids, but the
+                                       // protocol requires *some* number.
+      EmplaceSafeString(error_json, "format", error.GetCString());
+      error_json.try_emplace("showUser", true);
+
+      llvm::json::Object body;
+      body.try_emplace("error", std::move(error_json));
+
+      response.try_emplace("message", "lldb-error");
+      response.try_emplace("body", std::move(body));
+    }
+  }
+  return true; // Success
 }
 
 llvm::Error DAP::Loop() {

@@ -256,6 +256,7 @@ static std::optional<std::string> TryCreateAutoSummary(lldb::SBValue value) {
   return TryCreateAutoSummaryForContainer(value);
 }
 
+// XXX remove
 void FillResponse(const llvm::json::Object &request,
                   llvm::json::Object &response) {
   // Fill in all of the needed response fields to a "request" and set "success"

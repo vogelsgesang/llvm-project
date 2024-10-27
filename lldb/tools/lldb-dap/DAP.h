@@ -14,6 +14,7 @@
 #include <map>
 #include <optional>
 #include <thread>
+#include <variant>
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -63,8 +64,9 @@ enum DAPBroadcasterBits {
   eBroadcastBitStopProgressThread = 1u << 1
 };
 
-typedef void (*RequestCallback)(const llvm::json::Object &command);
-typedef void (*ResponseCallback)(llvm::Expected<llvm::json::Value> value);
+using RequestCallbackResult = std::variant<llvm::json::Object, lldb::SBError>;
+using RequestCallback = RequestCallbackResult (*)(const llvm::json::Object *arguments);
+using ResponseCallback = void (*)(llvm::Expected<llvm::json::Value> value);
 
 enum class PacketStatus {
   Success = 0,
@@ -281,6 +283,7 @@ struct DAP {
 
   PacketStatus GetNextObject(llvm::json::Object &object);
   bool HandleObject(const llvm::json::Object &object);
+  bool HandleRequest(const llvm::json::Object &request);
 
   llvm::Error Loop();
 
