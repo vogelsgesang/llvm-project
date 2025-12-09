@@ -3734,11 +3734,11 @@ llvm::Expected<uint32_t> Target::AddScriptedFrameProviderDescriptor(
 
   {
     std::unique_lock<std::recursive_mutex> guard(
-      m_frame_provider_descriptors_mutex);
+        m_frame_provider_descriptors_mutex);
     m_frame_provider_descriptors[descriptor_id] = descriptor;
   }
 
-  NotifyThreadsOfChangedFrameProviders();
+  InvalidateThreadFrameProviders();
 
   return descriptor_id;
 }
@@ -3752,7 +3752,7 @@ bool Target::RemoveScriptedFrameProviderDescriptor(uint32_t id) {
   }
 
   if (removed)
-    NotifyThreadsOfChangedFrameProviders();
+    InvalidateThreadFrameProviders();
   return removed;
 }
 
@@ -3763,7 +3763,7 @@ void Target::ClearScriptedFrameProviderDescriptors() {
     m_frame_provider_descriptors.clear();
   }
 
-  NotifyThreadsOfChangedFrameProviders();
+  InvalidateThreadFrameProviders();
 }
 
 const llvm::DenseMap<uint32_t, ScriptedFrameProviderDescriptor> &
@@ -3773,7 +3773,7 @@ Target::GetScriptedFrameProviderDescriptors() const {
   return m_frame_provider_descriptors;
 }
 
-void Target::NotifyThreadsOfChangedFrameProviders() {
+void Target::InvalidateThreadFrameProviders() {
   ProcessSP process_sp = GetProcessSP();
   if (!process_sp)
     return;

@@ -778,7 +778,7 @@ public:
 
 protected:
   /// Notify all threads that the stack traces might have changed.
-  void NotifyThreadsOfChangedFrameProviders();
+  void InvalidateThreadFrameProviders();
 
 public:
   // This part handles the breakpoints.
