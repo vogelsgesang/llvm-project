@@ -142,6 +142,7 @@ static void diagnoseBadTypeAttribute(Sema &S, const ParsedAttr &attr,
   case ParsedAttr::AT_PreserveAll:                                             \
   case ParsedAttr::AT_M68kRTD:                                                 \
   case ParsedAttr::AT_PreserveNone:                                            \
+  case ParsedAttr::AT_CoroHandleFn:                                            \
   case ParsedAttr::AT_RISCVVectorCC:                                           \
   case ParsedAttr::AT_RISCVVLSCC
 
@@ -7805,6 +7806,8 @@ static Attr *getCCTypeAttr(ASTContext &Ctx, ParsedAttr &Attr) {
     return createSimpleAttr<M68kRTDAttr>(Ctx, Attr);
   case ParsedAttr::AT_PreserveNone:
     return createSimpleAttr<PreserveNoneAttr>(Ctx, Attr);
+  case ParsedAttr::AT_CoroHandleFn:
+    return createSimpleAttr<CoroHandleFnAttr>(Ctx, Attr);
   case ParsedAttr::AT_RISCVVectorCC:
     return createSimpleAttr<RISCVVectorCCAttr>(Ctx, Attr);
   case ParsedAttr::AT_RISCVVLSCC: {
@@ -8401,6 +8404,44 @@ static bool handleFunctionTypeAttr(TypeProcessingState &state, ParsedAttr &attr,
         << attr.isRegularKeywordAttribute();
     attr.setInvalid();
     return true;
+  }
+
+  // coro_handle_fn restricts the signature shape to match what the
+  // coroutine lowering expects of a resume/destroy function: exactly one
+  // pointer parameter, void return, no varargs.
+  if (CC == CC_CoroHandleFn) {
+    enum : unsigned {
+      NeedVoidReturn = 0,
+      NeedSingleParam = 1,
+      NeedPointerParam = 2,
+      NeedNoVarargs = 3,
+    };
+    auto Diagnose = [&](unsigned Kind) {
+      S.Diag(attr.getLoc(), diag::err_coro_handle_fn_signature) << Kind;
+      attr.setInvalid();
+    };
+    if (!fn->getReturnType()->isVoidType()) {
+      Diagnose(NeedVoidReturn);
+      return true;
+    }
+    if (const auto *FPT = dyn_cast<FunctionProtoType>(fn)) {
+      if (FPT->isVariadic()) {
+        Diagnose(NeedNoVarargs);
+        return true;
+      }
+      if (FPT->getNumParams() != 1) {
+        Diagnose(NeedSingleParam);
+        return true;
+      }
+      if (!FPT->getParamType(0)->isPointerType()) {
+        Diagnose(NeedPointerParam);
+        return true;
+      }
+    } else {
+      // K&R-style (no-prototype) function. Require a prototype.
+      Diagnose(NeedSingleParam);
+      return true;
+    }
   }
 
   // Modify the CC from the wrapped function type, wrap it all back, and then

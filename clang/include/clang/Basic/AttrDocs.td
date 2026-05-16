@@ -6796,6 +6796,63 @@ may be changed in the future.
   }];
 }
 
+def CoroHandleFnDocs : Documentation {
+  let Category = DocCatCallingConvs;
+  let Content = [{
+The ``coro_handle_fn`` attribute marks a function as using the calling
+convention that Clang/LLVM uses for the resume and destroy functions of a
+coroutine (LLVM's ``fastcc``). It is intended for hand-written implementations
+of ``std::coroutine_handle``-like frames that are installed where the
+coroutine lowering expects to be able to invoke a resume or destroy function
+through a function pointer.
+
+Without this attribute, a user-written ``void f(void*)`` and the indirect
+call site that LLVM's coroutine lowering generates have mismatched calling
+conventions, which the optimizer is free to (and does) turn into
+``unreachable``. With the attribute the user function is emitted with
+``fastcc`` so the call site matches.
+
+The attribute is restricted to a fixed signature shape that matches the
+coroutine ABI:
+
+- exactly one parameter, which must have pointer type,
+- ``void`` return type,
+- no variadic arguments.
+
+Other signatures are rejected with a diagnostic, so that the attribute can
+only be applied to functions the coroutine machinery could actually call.
+
+**ABI stability**: ``coro_handle_fn`` is a thin wrapper over LLVM's
+``fastcc``, whose ABI is intentionally unstable across LLVM versions and
+targets. Code using this attribute must be compiled and linked with a single
+LLVM version; do not use it across translation units built with different
+compilers or different versions of Clang.
+
+Example mirroring the issue #91123 ``coroutine_frame<F>`` pattern:
+
+.. code-block:: c++
+
+  #include <coroutine>
+
+  template <class F>
+  struct coroutine_frame {
+    [[clang::coro_handle_fn]] static void do_resume(void *p) {
+      (*static_cast<F *>(p))();
+    }
+    [[clang::coro_handle_fn]] static void do_destroy(void *) {}
+
+    F f;
+
+    std::coroutine_handle<> handle() noexcept {
+      return std::coroutine_handle<>::from_address(
+          // Pseudocode: construct a handle whose resume/destroy slots
+          // point at do_resume/do_destroy and whose frame is &f.
+          /* ... */);
+    }
+  };
+  }];
+}
+
 def DeprecatedDocs : Documentation {
   let Category = DocCatDecl;
   let Content = [{

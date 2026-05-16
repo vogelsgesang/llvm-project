@@ -60,6 +60,12 @@ __attribute__((preserve_none)) int add_preserve_none(int a, int b) {
   return a+b;
 }
 
+// LINUX: !DISubprogram({{.*}}"do_resume_coro_handle_fn", {{.*}}type: ![[FTY:[0-9]+]]
+// LINUX: ![[FTY]] = !DISubroutineType({{.*}}cc: DW_CC_LLVM_CoroHandleFn,
+__attribute__((coro_handle_fn)) void do_resume_coro_handle_fn(void *p) {
+  (void)p;
+}
+
 // LINUX: !DISubprogram({{.*}}"add_swiftcall", {{.*}}type: ![[FTY:[0-9]+]]
 // LINUX: ![[FTY]] = !DISubroutineType({{.*}}cc: DW_CC_LLVM_Swift,
 __attribute__((swiftcall)) int add_swiftcall(int a, int b) {

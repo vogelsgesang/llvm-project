@@ -315,6 +315,17 @@ Removed Compiler Flags
 Attribute Changes in Clang
 --------------------------
 
+- Added a new function attribute ``[[clang::coro_handle_fn]]`` /
+  ``__attribute__((coro_handle_fn))`` that selects the same calling convention
+  Clang/LLVM uses internally for coroutine resume/destroy functions (LLVM's
+  ``fastcc``). This enables user code to provide hand-written
+  ``std::coroutine_handle``-like frames without the resume/destroy call site
+  being optimized into ``unreachable`` by InstCombine due to a calling
+  convention mismatch. The attribute requires a fixed signature shape: exactly
+  one pointer parameter, ``void`` return, no variadic arguments. The
+  underlying ABI is intentionally unstable; code using this attribute must be
+  built and linked with a single LLVM version.
+
 - Added new attribute ``stack_protector_ignore`` to opt specific local variables out of
   the analysis which determines if a function should get a stack protector.  A function
   will still generate a stack protector if other local variables or command line flags

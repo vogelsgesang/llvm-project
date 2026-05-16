@@ -4111,6 +4111,9 @@ def warn_cconv_knr : Warning<
   InGroup<DiagGroup<"missing-prototype-for-cc">>;
 def err_cconv_varargs : Error<
   "variadic function cannot use %0 calling convention">;
+def err_coro_handle_fn_signature : Error<
+  "'coro_handle_fn' attribute requires a function with "
+  "%select{a 'void' return type|exactly one parameter|a pointer parameter|no variadic arguments}0">;
 def err_regparm_mismatch : Error<"function declared with regparm(%0) "
   "attribute was previously declared "
   "%plural{0:without the regparm|:with the regparm(%1)}1 attribute">;

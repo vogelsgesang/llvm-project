@@ -3152,6 +3152,8 @@ void MicrosoftCXXNameMangler::mangleCallingConvention(CallingConv CC,
   //                      ::= U # __attribute__((__preserve_most__))
   //                      ::= V # __attribute__((__preserve_none__)) //
   //                      Clang-only
+  //                      ::= T # __attribute__((__coro_handle_fn__)) //
+  //                      Clang-only
   //                            // Clang-only
   //                      ::= w # __regcall
   //                      ::= x # __regcall4
@@ -3195,6 +3197,9 @@ void MicrosoftCXXNameMangler::mangleCallingConvention(CallingConv CC,
       return;
     case CC_PreserveNone:
       Out << 'V';
+      return;
+    case CC_CoroHandleFn:
+      Out << 'T';
       return;
     case CC_X86RegCall:
       if (getASTContext().getLangOpts().RegCall4)

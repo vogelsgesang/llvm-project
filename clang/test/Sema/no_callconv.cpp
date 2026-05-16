@@ -16,6 +16,7 @@ void __attribute__((pascal)) funcG() {} // expected-error {{'pascal' calling con
 void __attribute__((preserve_most)) funcL() {} // expected-error {{'preserve_most' calling convention is not supported for this target}}
 void __attribute__((preserve_all)) funcM() {} // expected-error {{'preserve_all' calling convention is not supported for this target}}
 void __attribute__((preserve_none)) funcN() {} // expected-error {{'preserve_none' calling convention is not supported for this target}}
+void __attribute__((coro_handle_fn)) funcO(void *p) {} // expected-error {{'coro_handle_fn' calling convention is not supported for this target}}
 void __attribute__((stdcall)) funcD() {} // expected-error {{'stdcall' calling convention is not supported for this target}}
 void __attribute__((fastcall)) funcE() {} // expected-error {{'fastcall' calling convention is not supported for this target}}
 void __attribute__((thiscall)) funcF() {} // expected-error {{'thiscall' calling convention is not supported for this target}}
@@ -32,6 +33,7 @@ void __attribute__((swiftasynccall)) funcKK() {}
 void __attribute__((preserve_most)) funcL() {}
 void __attribute__((preserve_all)) funcM() {}
 void __attribute__((preserve_none)) funcN() {}
+void __attribute__((coro_handle_fn)) funcO(void *p) {}
 
 // Same function with different calling conventions. Error with a note pointing to the last decl.
 void __attribute__((preserve_all)) funcR(); // expected-note {{previous declaration is here}}

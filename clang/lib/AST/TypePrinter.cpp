@@ -1176,6 +1176,9 @@ void TypePrinter::printFunctionAfter(const FunctionType::ExtInfo &Info,
     case CC_PreserveNone:
       OS << " __attribute__((preserve_none))";
       break;
+    case CC_CoroHandleFn:
+      OS << " __attribute__((coro_handle_fn))";
+      break;
     case CC_RISCVVectorCall:
       OS << "__attribute__((riscv_vector_cc))";
       break;
@@ -1853,6 +1856,9 @@ void TypePrinter::printAttributedBefore(const AttributedType *T,
   } else if (T->getAttrKind() == attr::PreserveAll) {
     OS << "__attribute__((preserve_all)) ";
     spaceBeforePlaceHolder(OS);
+  } else if (T->getAttrKind() == attr::CoroHandleFn) {
+    OS << "__attribute__((coro_handle_fn)) ";
+    spaceBeforePlaceHolder(OS);
   }
 
   if (T->getAttrKind() == attr::AddressSpace)
@@ -1968,7 +1974,8 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
 
   if (T->getAttrKind() == attr::PreserveAll ||
       T->getAttrKind() == attr::PreserveMost ||
-      T->getAttrKind() == attr::PreserveNone) {
+      T->getAttrKind() == attr::PreserveNone ||
+      T->getAttrKind() == attr::CoroHandleFn) {
     // This has to be printed before the type.
     return;
   }
@@ -2042,6 +2049,7 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
   case attr::PreserveAll:
   case attr::PreserveMost:
   case attr::PreserveNone:
+  case attr::CoroHandleFn:
   case attr::OverflowBehavior:
     llvm_unreachable("This attribute should have been handled already");
 

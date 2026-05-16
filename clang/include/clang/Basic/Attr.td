@@ -3566,6 +3566,12 @@ def PreserveNone : DeclOrTypeAttr,
   let Documentation = [PreserveNoneDocs];
 }
 
+def CoroHandleFn : DeclOrTypeAttr {
+  let Spellings = [Clang<"coro_handle_fn">];
+  let Subjects = SubjectList<[FunctionLike]>;
+  let Documentation = [CoroHandleFnDocs];
+}
+
 def RISCVVectorCC: DeclOrTypeAttr, TargetSpecificAttr<TargetRISCV> {
  let Spellings = [CXX11<"riscv", "vector_cc">,
                   C23<"riscv", "vector_cc">,

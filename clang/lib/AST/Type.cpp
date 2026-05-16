@@ -3743,6 +3743,8 @@ StringRef FunctionType::getNameForCallConv(CallingConv CC) {
     return "m68k_rtd";
   case CC_PreserveNone:
     return "preserve_none";
+  case CC_CoroHandleFn:
+    return "coro_handle_fn";
     // clang-format off
   case CC_RISCVVectorCall: return "riscv_vector_cc";
 #define CC_VLS_CASE(ABI_VLEN) \
@@ -4553,6 +4555,7 @@ bool AttributedType::isCallingConv() const {
   case attr::PreserveAll:
   case attr::M68kRTD:
   case attr::PreserveNone:
+  case attr::CoroHandleFn:
   case attr::RISCVVectorCC:
   case attr::RISCVVLSCC:
     return true;

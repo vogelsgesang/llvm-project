@@ -817,6 +817,9 @@ void DWARFTypePrinter<DieType>::appendSubroutineNameAfter(
     case dwarf::CallingConvention::DW_CC_LLVM_M68kRTD:
       OS << " __attribute__((m68k_rtd))";
       break;
+    case dwarf::CallingConvention::DW_CC_LLVM_CoroHandleFn:
+      OS << " __attribute__((coro_handle_fn))";
+      break;
     }
   }
 

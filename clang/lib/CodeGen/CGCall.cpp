@@ -105,6 +105,8 @@ unsigned CodeGenTypes::ClangCallConvToLLVMCallConv(CallingConv CC) {
     return llvm::CallingConv::M68k_RTD;
   case CC_PreserveNone:
     return llvm::CallingConv::PreserveNone;
+  case CC_CoroHandleFn:
+    return llvm::CallingConv::Fast;
     // clang-format off
   case CC_RISCVVectorCall: return llvm::CallingConv::RISCV_VectorCall;
     // clang-format on
