@@ -119,16 +119,35 @@ bool coro::declaresIntrinsics(const Module &M, ArrayRef<Intrinsic::ID> List) {
 }
 
 // Replace all coro.frees associated with the provided frame with 'null' and
-// erase all associated coro.deads
+// erase all associated coro.deads.
+//
+// `FramePtr` is the CoroBegin value (or its noalloc-clone substitute). For
+// switch-ABI coroutines whose promise is over-aligned (see issue #58397),
+// buildCoroutineFrame splices a `+HandleOffset` GEP right after CoroBegin
+// so that user-facing `coro.free` calls take the handle (= alloc +
+// HandleOffset) as their frame argument instead of the raw allocation
+// pointer. The `coro.free`s are therefore users of that GEP, not of
+// CoroBegin directly. We walk one hop through such GEPs so this routine
+// remains the single source of truth for "find all coro.free uses tied to
+// this frame".
 void coro::elideCoroFree(Value *FramePtr) {
   SmallVector<CoroFreeInst *, 4> CoroFrees;
   SmallVector<CoroDeadInst *, 4> CoroDeads;
-  for (User *U : FramePtr->users()) {
-    if (auto *CF = dyn_cast<CoroFreeInst>(U))
-      CoroFrees.push_back(CF);
-    else if (auto *CD = dyn_cast<CoroDeadInst>(U))
-      CoroDeads.push_back(CD);
-  }
+  auto Collect = [&](Value *V) {
+    for (User *U : V->users()) {
+      if (auto *CF = dyn_cast<CoroFreeInst>(U))
+        CoroFrees.push_back(CF);
+      else if (auto *CD = dyn_cast<CoroDeadInst>(U))
+        CoroDeads.push_back(CD);
+    }
+  };
+  Collect(FramePtr);
+  // Also look through the `+HandleOffset` GEP inserted by
+  // buildCoroutineFrame; any `coro.free` whose frame operand is the handle
+  // (instead of the raw CoroBegin pointer) reaches us through this hop.
+  for (User *U : FramePtr->users())
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U))
+      Collect(GEP);
 
   Value *Replacement =
       ConstantPointerNull::get(PointerType::get(FramePtr->getContext(), 0));

@@ -941,15 +941,49 @@ void coro::BaseCloner::create() {
   auto NewAttrs = AttributeList();
 
   switch (Shape.ABI) {
-  case coro::ABI::Switch:
+  case coro::ABI::Switch: {
     // Bootstrap attributes by copying function attributes from the
     // original function.  This should include optimization settings and so on.
     NewAttrs = NewAttrs.addFnAttributes(
         Context, AttrBuilder(Context, OrigAttrs.getFnAttrs()));
 
-    addFramePointerAttrs(NewAttrs, Context, 0, Shape.FrameSize,
-                         Shape.FrameAlign, /*NoAlias=*/false);
+    // The frame_ptr the resume/destroy clones receive is the *handle*, which
+    // is `alloc_ptr + HandleOffset` for over-aligned promises. The clone
+    // only touches bytes [HandleOffset, FrameSize), and the handle's
+    // alignment is gcd(FrameAlign, HandleOffset) — degraded from FrameAlign
+    // whenever HandleOffset is not a multiple of FrameAlign. The standard
+    // `align`/`dereferenceable` param attrs therefore describe only the
+    // payload region. To let CoroElide recreate the full allocation, we
+    // additionally stash the full (FrameSize, FrameAlign) on the handle
+    // param via the string-valued `"coro-frame-size"`/`"coro-frame-align"`
+    // param attributes — see CoroElide::getFrameLayout.
+    unsigned HandleOffset = Shape.SwitchLowering.HandleOffset;
+    Align FramePtrAlign = Shape.FrameAlign;
+    uint64_t FramePtrDeref = Shape.FrameSize;
+    if (HandleOffset > 0) {
+      // The handle = alloc + HandleOffset, with alloc aligned to FrameAlign
+      // (a power of two). The actual alignment of `alloc + HandleOffset` is
+      // the largest power of two dividing both — i.e.
+      // min(FrameAlign, 1 << countr_zero(HandleOffset)). Note HandleOffset
+      // need not be a power of two (e.g. PromiseAlign=64 yields
+      // HandleOffset=48), so `bit_floor` would be wrong here. The
+      // `HandleOffset > 0` guard is load-bearing for countr_zero, which is
+      // undefined on zero.
+      FramePtrDeref = Shape.FrameSize - HandleOffset;
+      FramePtrAlign = Align(std::min<uint64_t>(
+          Shape.FrameAlign.value(),
+          uint64_t(1) << llvm::countr_zero(uint64_t(HandleOffset))));
+      AttrBuilder FullLayout(Context);
+      FullLayout.addAttribute("coro-frame-size",
+                              std::to_string(Shape.FrameSize));
+      FullLayout.addAttribute("coro-frame-align",
+                              std::to_string(Shape.FrameAlign.value()));
+      NewAttrs = NewAttrs.addParamAttributes(Context, 0, FullLayout);
+    }
+    addFramePointerAttrs(NewAttrs, Context, 0, FramePtrDeref, FramePtrAlign,
+                         /*NoAlias=*/false);
     break;
+  }
   case coro::ABI::Async: {
     auto *ActiveAsyncSuspend = cast<CoroSuspendAsyncInst>(ActiveSuspend);
     if (OrigF.hasParamAttribute(Shape.AsyncLowering.ContextArgNo,
@@ -1407,6 +1441,16 @@ struct SwitchCoroutineSplitter {
   //  - Has one additional frame pointer parameter in lieu of dynamic
   //  allocation.
   //  - Suppressed allocations by replacing coro.alloc and coro.free.
+  //
+  // The extra parameter is the *allocation base*, not the coroutine handle.
+  // `.noalloc` stands in for `operator new` for HALO callers, who care about
+  // buffer geometry (size + alignment of the whole frame including any
+  // over-aligned-promise prefix), so the standard `dereferenceable` / `align`
+  // param attrs naturally describe the full allocation. The handle is
+  // recovered inside the ramp via the existing `+HandleOffset` GEP off
+  // `coro.begin`. This is intentionally different from resume/destroy/cleanup
+  // clones, whose first arg is the handle (dictated by the public
+  // coroutine_handle ABI: `h.resume()` calls `(*h)(h)`).
   static Function *createNoAllocVariant(Function &F, coro::Shape &Shape,
                                         SmallVectorImpl<Function *> &Clones) {
     assert(Shape.ABI == coro::ABI::Switch);

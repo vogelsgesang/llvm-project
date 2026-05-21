@@ -49,20 +49,34 @@ void Lowerer::lowerResumeOrDestroy(CallBase &CB,
 // Coroutine promise field is always at the fixed offset from the beginning of
 // the coroutine frame. i8* coro.promise(i8*, i1 from) intrinsic adds an offset
 // to a passed pointer to move from coroutine frame to coroutine promise and
-// vice versa. Since we don't know exactly which coroutine frame it is, we build
-// a coroutine frame mock up starting with two function pointers, followed by a
-// properly aligned coroutine promise field.
-// TODO: Handle the case when coroutine promise alloca has align override.
+// vice versa.
+//
+// The promise lives at offset 2*ptrsize from the coroutine handle (the
+// C++20 coroutine ABI invariant; see issue #58397). When the calling
+// function carries the legacy `"coro-legacy-promise-layout"` attribute
+// (`-fclang-abi-compat <= 22`), we fall back to the pre-fix offset of
+// `alignTo(2*ptrsize, PromiseAlign)` to stay link-compatible with frames
+// laid out by old Clang releases that put the promise at the higher
+// over-aligned offset.
 void Lowerer::lowerCoroPromise(CoroPromiseInst *Intrin) {
   Value *Operand = Intrin->getArgOperand(0);
   Align Alignment = Intrin->getAlignment();
   Type *Int8Ty = Builder.getInt8Ty();
 
-  auto *SampleStruct =
-      StructType::get(Context, {AnyResumeFnPtrTy, AnyResumeFnPtrTy, Int8Ty});
   const DataLayout &DL = TheModule.getDataLayout();
-  int64_t Offset = alignTo(
-      DL.getStructLayout(SampleStruct)->getElementOffset(2), Alignment);
+  const Function *CallerF = Intrin->getFunction();
+  const bool LegacyLayout =
+      CallerF && CallerF->hasFnAttribute("coro-legacy-promise-layout");
+
+  int64_t Offset;
+  if (LegacyLayout) {
+    auto *SampleStruct =
+        StructType::get(Context, {AnyResumeFnPtrTy, AnyResumeFnPtrTy, Int8Ty});
+    Offset = alignTo(
+        DL.getStructLayout(SampleStruct)->getElementOffset(2), Alignment);
+  } else {
+    Offset = 2 * DL.getPointerSize();
+  }
   if (Intrin->isFromPromise())
     Offset = -Offset;
 

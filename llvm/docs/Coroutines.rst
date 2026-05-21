@@ -1091,6 +1091,65 @@ with small positive and negative offsets).
 
 A frontend should emit exactly one `coro.begin` intrinsic per coroutine.
 
+.. _coro.begin.padding:
+
+Post-CoroFrame layout invariant (Switch ABI)
+""""""""""""""""""""""""""""""""""""""""""""
+
+For the Switch ABI, `CoroFrame` may insert a fixed positive offset
+between the value passed to `coro.begin` (= the raw allocation pointer,
+also called the "frame pointer" in the LLVM IR) and the *coroutine handle*
+that user code sees and that all later passes treat as ``%frame``. This
+happens when the C++ promise type's alignment exceeds ``2*sizeof(void*)``:
+the handle is then ``%mem + HandleOffset`` where ``HandleOffset =
+alignof(promise) - 2*sizeof(void*)``, so the promise lands at the
+ABI-mandated offset ``2*sizeof(void*)`` relative to the handle (see
+`#58397 <https://github.com/llvm/llvm-project/issues/58397>`_).
+
+Concretely, after `CoroFrame` the IR looks like:
+
+.. code-block:: llvm
+
+  %alloc = call ptr @llvm.coro.begin(token %id, ptr %mem)
+  %hdl   = getelementptr inbounds i8, ptr %alloc, i64 <HandleOffset>
+  ...                          ; all later uses go through %hdl
+
+  cleanup:
+    %dealloc = call ptr @llvm.coro.free(token %id, ptr %hdl)
+    %is_null = icmp eq ptr %dealloc, null
+    %adj     = getelementptr inbounds i8, ptr %dealloc, i64 -<HandleOffset>
+    %mem2    = select i1 %is_null, ptr null, ptr %adj
+    ; %mem2 is what gets passed to `operator delete`.
+
+Notes for pass authors and downstream tooling:
+
+* `coro.free`'s "frame" operand is the **handle** (``%hdl``), not the
+  raw allocation pointer. After `CoroCleanup` lowers `coro.free` to its
+  frame argument and InstCombine folds the ``+/-HandleOffset`` GEPs, the
+  surviving value is the original ``%mem`` (the allocation pointer the
+  user can pass to ``operator delete``).
+* The wrapping ``select`` around the ``-HandleOffset`` GEP is
+  **load-bearing on the elide / no-suspend / HALO paths**: when
+  ``coro::elideCoroFree`` rewrites `coro.free` to ``null`` (because the
+  allocation has been elided to a stack alloca or to the caller's
+  frame), a bare ``getelementptr inbounds ptr null, i64 -HandleOffset``
+  would be a poison non-null pointer, and the user's
+  ``if (mem) operator_delete(mem)`` would silently
+  ``free()`` a stack pointer.
+* Helpers that need to enumerate `coro.free` calls for a given
+  coroutine should walk one hop through the ``%hdl`` GEP (see
+  ``coro::elideCoroFree``), since the `coro.free` is a user of
+  ``%hdl``, not of `coro.begin` directly.
+* The resume / destroy / cleanup clones receive the **handle** as their
+  first argument; their parameter attributes (``align``,
+  ``dereferenceable``) describe the handle, not the full allocation.
+  See `CoroSplit::create`.
+
+For coroutines whose promise alignment is at most ``2*sizeof(void*)``
+(the overwhelming majority) ``HandleOffset == 0`` and none of the GEPs
+above are inserted, so the IR shape is byte-identical to pre-fix
+behavior.
+
 .. _coro.begin.custom.abi:
 
 'llvm.coro.begin.custom.abi' Intrinsic

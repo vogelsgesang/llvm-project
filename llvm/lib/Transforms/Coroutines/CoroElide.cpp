@@ -111,14 +111,57 @@ static void removeTailCallAttribute(AllocaInst *Frame, AAResults &AA) {
 }
 
 // Given a resume function @f.resume(%f.frame* %frame), returns the size
-// and expected alignment of %f.frame type.
+// and expected alignment of the underlying allocation.
+//
+// For an over-aligned-promise frame the resume function's first param is
+// the *handle* = `alloc + HandleOffset`, so the standard `dereferenceable`
+// / `align` param attrs describe only the payload region. The full
+// allocation geometry is stashed by CoroSplit in the string-valued
+// `"coro-frame-size"` / `"coro-frame-align"` param attributes on the same
+// argument; prefer those when present so we allocate enough bytes and
+// alignment to cover the prefix. The post-CoroFrame IR already contains a
+// `+HandleOffset` GEP off `coro.begin`, so replacing `coro.begin` with the
+// alloca's base pointer produces the correct handle without any
+// HandleOffset-aware code here.
 static std::optional<std::pair<uint64_t, Align>>
 getFrameLayout(Function *Resume) {
-  // Pull information from the function attributes.
+  if (Attribute SizeAttr = Resume->getAttributeAtIndex(
+          AttributeList::FirstArgIndex, "coro-frame-size");
+      SizeAttr.isValid()) {
+    uint64_t Size;
+    if (SizeAttr.getValueAsString().getAsInteger(10, Size))
+      return std::nullopt;
+    uint64_t AlignVal = 1;
+    if (Attribute AlignAttr = Resume->getAttributeAtIndex(
+            AttributeList::FirstArgIndex, "coro-frame-align");
+        AlignAttr.isValid())
+      AlignAttr.getValueAsString().getAsInteger(10, AlignVal);
+    return std::make_pair(Size, Align(AlignVal));
+  }
+
   auto Size = Resume->getParamDereferenceableBytes(0);
   if (!Size)
     return std::nullopt;
   return std::make_pair(Size, Resume->getParamAlign(0).valueOrOne());
+}
+
+// Returns the post-CoroFrame `+HandleOffset` GEP off `CB` (the value spelled
+// `Shape.FramePtr`) if one is present, otherwise null. After CoroFrame, any
+// access through the coroutine handle — `coro.subfn.addr`, `coro.free`,
+// field load/store — uses this GEP rather than `coro.begin` directly when
+// the promise is over-aligned (HandleOffset > 0). Callers that want to
+// reason about "handle-equivalent" uses must look at both `CB->users()` and
+// `getHandleGEP(CB)->users()`.
+static GetElementPtrInst *getHandleGEP(const CoroBeginInst *CB) {
+  GetElementPtrInst *Result = nullptr;
+  for (const User *U : CB->users()) {
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      if (Result)
+        return nullptr; // Ambiguous: more than one GEP.
+      Result = const_cast<GetElementPtrInst *>(GEP);
+    }
+  }
+  return Result;
 }
 
 // Finds first non alloca instruction in the entry block of a function.
@@ -179,27 +222,33 @@ CoroIdElider::CoroIdElider(CoroIdInst *CoroId, FunctionElideInfo &FEI,
   }
 
   for (CoroBeginInst *CB : CoroBegins) {
-    for (User *U : CB->users()) {
-      auto &CoroDeads = BeginDeadMap[CB];
-      // Collect all coro.subfn.addrs associated with coro.begin.
-      // Note, we only devirtualize the calls if their coro.subfn.addr refers to
-      // coro.begin directly. If we run into cases where this check is too
-      // conservative, we can consider relaxing the check.
-      if (auto *II = dyn_cast<CoroSubFnInst>(U)) {
-        switch (II->getIndex()) {
-        case CoroSubFnInst::ResumeIndex:
-          ResumeAddr.push_back(II);
-          break;
-        case CoroSubFnInst::DestroyIndex:
-          CoroDeads.push_back(II); // coro.destroy implies coro.dead
-          DestroyAddr.push_back(II);
-          break;
-        default:
-          llvm_unreachable("unexpected coro.subfn.addr constant");
-        }
-      } else if (auto *II = dyn_cast<CoroDeadInst>(U))
-        CoroDeads.push_back(II);
-    }
+    auto &CoroDeads = BeginDeadMap[CB];
+    // Collect all coro.subfn.addrs associated with coro.begin.
+    // Note, we only devirtualize the calls if their coro.subfn.addr refers to
+    // coro.begin (or the post-CoroFrame `+HandleOffset` GEP off it) directly.
+    // If we run into cases where this check is too conservative, we can
+    // consider relaxing the check.
+    auto CollectFrom = [&](Value *V) {
+      for (User *U : V->users()) {
+        if (auto *II = dyn_cast<CoroSubFnInst>(U)) {
+          switch (II->getIndex()) {
+          case CoroSubFnInst::ResumeIndex:
+            ResumeAddr.push_back(II);
+            break;
+          case CoroSubFnInst::DestroyIndex:
+            CoroDeads.push_back(II); // coro.destroy implies coro.dead
+            DestroyAddr.push_back(II);
+            break;
+          default:
+            llvm_unreachable("unexpected coro.subfn.addr constant");
+          }
+        } else if (auto *II = dyn_cast<CoroDeadInst>(U))
+          CoroDeads.push_back(II);
+      }
+    };
+    CollectFrom(CB);
+    if (auto *HandleGEP = getHandleGEP(CB))
+      CollectFrom(HandleGEP);
   }
 }
 
@@ -262,24 +311,34 @@ bool CoroIdElider::canCoroBeginEscape(
     Visited.insert(DA->getParent());
 
   SmallPtrSet<const BasicBlock *, 32> EscapingBBs;
-  for (auto *U : CB->users()) {
-    // The use from coroutine intrinsics are not a problem.
-    if (isa<CoroFreeInst, CoroSubFnInst, CoroSaveInst>(U))
-      continue;
+  auto *HandleGEP = getHandleGEP(CB);
+  auto MarkUsers = [&](const Value *V) {
+    for (const User *U : V->users()) {
+      // The use from coroutine intrinsics are not a problem.
+      if (isa<CoroFreeInst, CoroSubFnInst, CoroSaveInst>(U))
+        continue;
+      // The +HandleOffset GEP off CoroBegin is transparent — its users are
+      // examined separately below.
+      if (U == HandleGEP)
+        continue;
 
-    // Think all other usages may be an escaping candidate conservatively.
-    //
-    // Note that the major user of switch ABI coroutine (the C++) will store
-    // resume.fn, destroy.fn and the index to the coroutine frame immediately.
-    // So the parent of the coro.begin in C++ will be always escaping.
-    // Then we can't get any performance benefits for C++ by improving the
-    // precision of the method.
-    //
-    // The reason why we still judge it is we want to make LLVM Coroutine in
-    // switch ABIs to be self contained as much as possible instead of a
-    // by-product of C++20 Coroutines.
-    EscapingBBs.insert(cast<Instruction>(U)->getParent());
-  }
+      // Think all other usages may be an escaping candidate conservatively.
+      //
+      // Note that the major user of switch ABI coroutine (the C++) will store
+      // resume.fn, destroy.fn and the index to the coroutine frame immediately.
+      // So the parent of the coro.begin in C++ will be always escaping.
+      // Then we can't get any performance benefits for C++ by improving the
+      // precision of the method.
+      //
+      // The reason why we still judge it is we want to make LLVM Coroutine in
+      // switch ABIs to be self contained as much as possible instead of a
+      // by-product of C++20 Coroutines.
+      EscapingBBs.insert(cast<Instruction>(U)->getParent());
+    }
+  };
+  MarkUsers(CB);
+  if (HandleGEP)
+    MarkUsers(HandleGEP);
 
   bool PotentiallyEscaped = false;
 
@@ -397,19 +456,24 @@ bool CoroIdElider::attemptElide() {
   replaceWithConstant(ResumeAddrConstant, ResumeAddr);
 
   bool EligibleForElide = lifetimeEligibleForElide();
+  auto FrameSizeAndAlign = getFrameLayout(cast<Function>(ResumeAddrConstant));
+
+  // The destroy → cleanup swap is only safe when we actually elide the
+  // heap allocation. Picking `Cleanup` (which skips the dealloc) without
+  // also replacing the heap allocation leaks the heap frame, so guard the
+  // swap on `getFrameLayout` succeeding too.
+  bool WillElide = EligibleForElide && FrameSizeAndAlign.has_value();
 
   auto *DestroyAddrConstant = Resumers->getAggregateElement(
-      EligibleForElide ? CoroSubFnInst::CleanupIndex
-                       : CoroSubFnInst::DestroyIndex);
+      WillElide ? CoroSubFnInst::CleanupIndex
+                : CoroSubFnInst::DestroyIndex);
 
   replaceWithConstant(DestroyAddrConstant, DestroyAddr);
-
-  auto FrameSizeAndAlign = getFrameLayout(cast<Function>(ResumeAddrConstant));
 
   auto CallerFunctionName = FEI.ContainingFunction->getName();
   auto CalleeCoroutineName = CoroId->getCoroutine()->getName();
 
-  if (EligibleForElide && FrameSizeAndAlign) {
+  if (WillElide) {
     elideHeapAllocations(FrameSizeAndAlign->first, FrameSizeAndAlign->second);
     NumOfCoroElided++;
 

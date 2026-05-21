@@ -116,7 +116,10 @@ struct FrameDataInfo {
   }
 
   // Update field offset and alignment information from FrameTypeBuilder.
-  void updateLayoutInfo(FrameTypeBuilder &B);
+  // `HandleOffset` is subtracted from each field's offset so that callers
+  // see handle-relative offsets even when the builder laid out the frame in
+  // allocation-base coordinates.
+  void updateLayoutInfo(FrameTypeBuilder &B, unsigned HandleOffset = 0);
 
 private:
   // Map from values to their slot indexes on the frame (insertion order).
@@ -294,7 +297,8 @@ public:
 };
 } // namespace
 
-void FrameDataInfo::updateLayoutInfo(FrameTypeBuilder &B) {
+void FrameDataInfo::updateLayoutInfo(FrameTypeBuilder &B,
+                                     unsigned HandleOffset) {
   auto Updater = [&](Value *I) {
     uint32_t FieldIndex = getFieldIndex(I);
     auto Field = B.getLayoutField(FieldIndex);
@@ -304,7 +308,18 @@ void FrameDataInfo::updateLayoutInfo(FrameTypeBuilder &B) {
             ? Field.DynamicAlignBuffer + Field.Alignment.value()
             : 0;
     setDynamicAlign(I, dynamicAlign);
-    setOffset(I, Field.Offset);
+    // Translate allocation-base-relative offsets to handle-relative ones.
+    // Zero-size allocas / spills are mapped to FieldIndex 0 by
+    // FrameTypeBuilder::addField (it short-circuits on FieldSize == 0),
+    // which in the unified layout is the prefix slot at Offset == 0 — i.e.
+    // logically *inside* the handle-offset region. Their address is
+    // unobservable (no load/store can touch zero bytes meaningfully), so
+    // pin them to handle-relative offset 0 instead of letting the
+    // subtraction underflow.
+    uint64_t Offset = Field.Offset >= HandleOffset
+                          ? Field.Offset - HandleOffset
+                          : 0u;
+    setOffset(I, Offset);
   };
   for (auto &S : Spills)
     Updater(S.first);
@@ -639,9 +654,25 @@ static void buildFrameDebugInfo(Function &F, coro::Shape &Shape,
   DIFile *DFile = DIS->getFile();
   unsigned LineNum = DIS->getLine();
 
+  // The DI struct describes the frame *as seen from Shape.FramePtr* (= the
+  // handle), so its reported size is the payload size and its alignment is
+  // the handle alignment. For over-aligned promises this is
+  // FrameSize - HandleOffset bytes at alignment
+  // min(FrameAlign, 1 << countr_zero(HandleOffset)) — the same degraded
+  // alignment CoroSplit puts on the resume function's frame_ptr param.
+  // For the common case HandleOffset == 0 this is byte-identical to the
+  // pre-fix values.
+  unsigned HandleOffset = Shape.SwitchLowering.HandleOffset;
+  uint64_t FrameDISize = Shape.FrameSize - HandleOffset;
+  uint64_t FrameDIAlign = Shape.FrameAlign.value();
+  if (HandleOffset > 0)
+    FrameDIAlign = std::min<uint64_t>(
+        FrameDIAlign,
+        uint64_t(1) << llvm::countr_zero(uint64_t(HandleOffset)));
+
   DICompositeType *FrameDITy = DBuilder.createStructType(
       DIS->getUnit(), Twine(F.getName() + ".coro_frame_ty").str(), DFile,
-      LineNum, Shape.FrameSize * 8, Shape.FrameAlign.value() * 8,
+      LineNum, FrameDISize * 8, FrameDIAlign * 8,
       llvm::DINode::FlagArtificial, nullptr, llvm::DINodeArray());
   SmallVector<Metadata *, 16> Elements;
   DataLayout Layout = F.getDataLayout();
@@ -795,9 +826,13 @@ static bool hasAccessingPromiseBeforeCB(const DominatorTree &DT,
 }
 // Build the coroutine frame type as a byte array.
 // The frame layout includes:
-//   - Resume function pointer at offset 0 (Switch ABI only)
-//   - Destroy function pointer at offset ptrsize (Switch ABI only)
-//   - Promise alloca (Switch ABI only, only if present)
+//   - (Switch ABI) Alignment-padding bytes (only when the promise has
+//     alignment > 2*ptrsize; bytes [0, HandleOffset) of the allocation are
+//     dead, the handle = allocation_ptr + HandleOffset)
+//   - Resume function pointer at offset 0 from the handle (Switch ABI only)
+//   - Destroy function pointer at offset ptrsize from the handle (Switch ABI)
+//   - Promise alloca at offset 2*ptrsize from the handle, naturally aligned
+//     (Switch ABI only, only if present)
 //   - Suspend/Resume index
 //   - Spilled values and allocas
 static void buildFrameLayout(Function &F, const DominatorTree &DT,
@@ -814,21 +849,86 @@ static void buildFrameLayout(Function &F, const DominatorTree &DT,
   AllocaInst *PromiseAlloca = Shape.getPromiseAlloca();
   std::optional<FieldIDType> SwitchIndexFieldId;
   IntegerType *SwitchIndexType = nullptr;
+  unsigned HandleOffset = 0;
+
+  // For the switch ABI, the in-memory layout of the frame is controlled by
+  // the C++20 coroutine ABI (Itanium draft, also adopted by MSVC):
+  //
+  //   [optional alignment padding][resume_fn][destroy_fn][promise][...]
+  //                               ^
+  //                               handle / Shape.FramePtr
+  //
+  // resume_fn/destroy_fn live at offsets 0 and ptrsize from the handle; the
+  // promise must live at exactly offset 2*ptrsize. When the promise has
+  // alignment greater than 2*ptrsize, the FrameTypeBuilder lays out the
+  // frame with `HandleOffset` bytes of slack at the front so that the
+  // promise lands at a properly-aligned address. The handle is then
+  // `allocation_ptr + HandleOffset`; buildCoroutineFrame emits the
+  // +HandleOffset GEP at coro.begin and the inverse -HandleOffset GEP at
+  // coro.free.
+  //
+  // We materialise the [padding][resume][destroy] region as a single opaque
+  // `IsHeader` field of size `PrefixSize = max(2*ptrsize, PromiseAlign)`.
+  // After `B.finish()` we subtract `HandleOffset` from every recorded field
+  // offset so downstream consumers see handle-relative offsets
+  // (resume@0, destroy@ptrsize, promise@2*ptrsize, ...) regardless of the
+  // alignment of the promise. The prefix field is given pointer-natural
+  // alignment (`Align(ptrsize)`) — the promise's own alignment dominates
+  // the overall struct alignment, so requesting more here would just
+  // over-align frames whose other fields don't need it.
+  //
+  // For PromiseAlign <= 2*ptrsize (overwhelmingly the common case) we have
+  // HandleOffset == 0, PrefixSize == 2*ptrsize, and the layout / IR is
+  // byte-identical to the pre-fix behaviour.
+  //
+  // When the legacy `"coro-legacy-promise-layout"` attribute is present
+  // (i.e. the user requested `-fclang-abi-compat <= 22` for ABI stability
+  // with old Clang releases that placed the promise at
+  // alignTo(2*ptrsize, PromiseAlign) instead), we keep the old behaviour:
+  // resume/destroy are two separate IsHeader fields and the promise is laid
+  // out via `addFieldForAlloca` with IsHeader=true, which uses
+  // `alignTo(StructSize, PromiseAlign)`. No padding, no GEPs.
+  const bool LegacyLayout =
+      F.hasFnAttribute("coro-legacy-promise-layout");
 
   if (Shape.ABI == coro::ABI::Switch) {
     auto *FnPtrTy = Shape.getSwitchResumePointerType();
+    const unsigned PtrSize = DL.getPointerSize();
+    const unsigned HeaderSize = 2 * PtrSize;
 
-    // Add header fields for the resume and destroy functions.
-    // We can rely on these being perfectly packed.
-    (void)B.addField(FnPtrTy, MaybeAlign(), /*header*/ true);
-    (void)B.addField(FnPtrTy, MaybeAlign(), /*header*/ true);
-
-    // PromiseAlloca field needs to be explicitly added here because it's
-    // a header field with a fixed offset based on its alignment. Hence it
-    // needs special handling.
-    if (PromiseAlloca)
-      FrameData.setFieldIndex(
-          PromiseAlloca, B.addFieldForAlloca(PromiseAlloca, /*header*/ true));
+    if (LegacyLayout) {
+      // Legacy path: separate IsHeader fields for resume / destroy / promise.
+      // The promise lands at `alignTo(2*ptrsize, PromiseAlign)` from the
+      // handle (= the allocation base), which is the broken ABI behaviour
+      // shipped by Clang <=22 and only kept for cross-release link compat.
+      (void)B.addField(FnPtrTy, MaybeAlign(), /*header*/ true);
+      (void)B.addField(FnPtrTy, MaybeAlign(), /*header*/ true);
+      if (PromiseAlloca)
+        FrameData.setFieldIndex(
+            PromiseAlloca,
+            B.addFieldForAlloca(PromiseAlloca, /*header*/ true));
+    } else {
+      // Unified post-fix path: always materialise the header as a single
+      // opaque prefix field of size max(2*ptrsize, PromiseAlign). For
+      // PromiseAlign <= 2*ptrsize (or no promise), PrefixSize == 2*ptrsize
+      // and HandleOffset == 0, so the IR is byte-identical to the legacy
+      // path; for over-aligned promises the +/-HandleOffset GEPs and the
+      // null-preserving select around coro.free kick in.
+      unsigned PrefixSize = HeaderSize;
+      if (PromiseAlloca &&
+          PromiseAlloca->getAlign().value() > HeaderSize) {
+        PrefixSize = PromiseAlloca->getAlign().value();
+        HandleOffset = PrefixSize - HeaderSize;
+      }
+      // `Align(PtrSize)` (not `Align(PrefixSize)`): the promise's own
+      // alignment carries the over-alignment requirement for the whole
+      // struct, so the prefix only needs natural pointer alignment.
+      (void)B.addField(PrefixSize, Align(PtrSize), /*header*/ true);
+      if (PromiseAlloca)
+        FrameData.setFieldIndex(
+            PromiseAlloca,
+            B.addFieldForAlloca(PromiseAlloca, /*header*/ true));
+    }
 
     // Add a field to store the suspend index.  This doesn't need to
     // be in the header.
@@ -872,7 +972,7 @@ static void buildFrameLayout(Function &F, const DominatorTree &DT,
 
   B.finish();
 
-  FrameData.updateLayoutInfo(B);
+  FrameData.updateLayoutInfo(B, HandleOffset);
   Shape.FrameAlign = B.getStructAlign();
   Shape.FrameSize = B.getStructSize();
 
@@ -882,11 +982,14 @@ static void buildFrameLayout(Function &F, const DominatorTree &DT,
     // Resume and Destroy function pointers are in the frame header.
     const DataLayout &DL = F.getDataLayout();
     Shape.SwitchLowering.DestroyOffset = DL.getPointerSize();
+    Shape.SwitchLowering.HandleOffset = HandleOffset;
 
     auto IndexField = B.getLayoutField(*SwitchIndexFieldId);
     Shape.SwitchLowering.IndexType = SwitchIndexType;
     Shape.SwitchLowering.IndexAlign = IndexField.Alignment.value();
-    Shape.SwitchLowering.IndexOffset = IndexField.Offset;
+    // Layout offsets are still in allocation-base coordinates; translate to
+    // handle-relative by subtracting HandleOffset.
+    Shape.SwitchLowering.IndexOffset = IndexField.Offset - HandleOffset;
 
     // Also round the frame size up to a multiple of its alignment, as is
     // generally expected in C/C++.
@@ -2033,7 +2136,63 @@ void coro::BaseABI::buildCoroutineFrame(bool OptimizeFrame) {
   // Build frame layout
   FrameDataInfo FrameData(Spills, Allocas);
   buildFrameLayout(F, DT, Shape, FrameData, OptimizeFrame);
-  Shape.FramePtr = Shape.CoroBegin;
+
+  // For Switch ABI with an over-aligned promise, the handle (FramePtr) is
+  // offset by `HandleOffset` bytes past the allocation pointer (= CoroBegin),
+  // so the promise lands at exactly 2*ptrsize from the handle. Splice a
+  // GEP after CoroBegin; everything downstream sees FramePtr as the handle
+  // and uses handle-relative offsets recorded in FrameData.
+  //
+  // Each `coro.free(id, frame_ptr)` must yield the original allocation
+  // pointer (so the user can `operator delete` it) on the live path, or
+  // null on the elided path (no-suspend / heap-elision / noalloc, where
+  // `coro::elideCoroFree` rewrites `coro.free` to a null constant). After
+  // CoroCleanup lowers `coro.free` to its frame operand and InstCombine
+  // folds `gep(gep(mem, +HandleOffset), -HandleOffset)`, the live path
+  // collapses to `mem` (= original `operator new` result). On the elided
+  // path a bare `gep(null, -HandleOffset) inbounds` would be a poison
+  // non-null value — feeding the user's `if (mem) operator_delete(mem)`
+  // check straight into a `free()` on a stack pointer. We therefore wrap
+  // the GEP in a null-preserving select:
+  //   live:   select(false, null, gep(hdl, -HandleOffset)) = alloc_ptr
+  //   elided: select(true,  null, poison)                  = null
+  if (Shape.ABI == coro::ABI::Switch &&
+      Shape.SwitchLowering.HandleOffset > 0) {
+    LLVMContext &Ctx = Shape.CoroBegin->getContext();
+    Type *I64 = Type::getInt64Ty(Ctx);
+    const unsigned HandleOffset = Shape.SwitchLowering.HandleOffset;
+
+    IRBuilder<> Builder(Shape.CoroBegin->getNextNode());
+    Value *FramePtrGep = Builder.CreateInBoundsPtrAdd(
+        Shape.CoroBegin, ConstantInt::get(I64, HandleOffset), "frame.ptr");
+    Shape.CoroBegin->replaceUsesWithIf(FramePtrGep, [FramePtrGep](Use &U) {
+      return U.getUser() != FramePtrGep;
+    });
+    Shape.FramePtr = FramePtrGep;
+
+    Constant *NullPtr =
+        ConstantPointerNull::get(PointerType::get(Ctx, 0));
+    Constant *NegHandleOffset = ConstantInt::get(I64, -int64_t(HandleOffset));
+    SmallVector<CoroFreeInst *, 2> CoroFrees;
+    for (User *U : Shape.CoroBegin->getId()->users())
+      if (auto *CF = dyn_cast<CoroFreeInst>(U))
+        CoroFrees.push_back(CF);
+    for (auto *CF : CoroFrees) {
+      IRBuilder<> FBuilder(CF->getNextNode());
+      Value *IsNull = FBuilder.CreateICmpEQ(CF, NullPtr, "alloc.ptr.isnull");
+      Value *Adjusted = FBuilder.CreateInBoundsPtrAdd(
+          CF, NegHandleOffset, "alloc.ptr.nonnull");
+      Value *AllocPtr =
+          FBuilder.CreateSelect(IsNull, NullPtr, Adjusted, "alloc.ptr");
+      CF->replaceUsesWithIf(AllocPtr, [Adjusted, IsNull](Use &U) {
+        Value *Usr = U.getUser();
+        return Usr != Adjusted && Usr != IsNull;
+      });
+    }
+  } else {
+    Shape.FramePtr = Shape.CoroBegin;
+  }
+
   // For now, this works for C++ programs only.
   buildFrameDebugInfo(F, Shape, FrameData);
   // Insert spills and reloads

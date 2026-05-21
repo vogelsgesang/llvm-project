@@ -110,6 +110,15 @@ struct Shape {
     unsigned DestroyOffset;
     unsigned IndexAlign;
     unsigned IndexOffset;
+    // Bytes between the allocation pointer (returned by operator new / the
+    // CoroBegin mem operand) and the coroutine handle pointer
+    // (= Shape.FramePtr, which points at resume_fn).
+    //
+    // Non-zero only when the promise has alignment > 2*ptrsize, in which case
+    // we add `HandleOffset` bytes of alignment padding before resume_fn so
+    // that the promise stays at the ABI-required offset of 2*ptrsize from the
+    // handle. See issue #58397.
+    unsigned HandleOffset;
     bool HasFinalSuspend;
     bool HasUnwindCoroEnd;
   };
