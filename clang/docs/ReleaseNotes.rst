@@ -70,6 +70,12 @@ ABI Changes in This Version
 - Fixed Itanium mangling for lambdas in instantiated non-static data member
   initializers by preserving the field-name closure-prefix. This changes the
   mangled names for affected lambdas. (#GH190555)
+- The resume and destroy functions of C++20 coroutines now use the platform C
+  calling convention instead of LLVM's internal ``fastcc``. This makes the
+  coroutine ABI stable across LLVM versions and interoperable with other
+  compilers. On most targets this is not a breaking change because ``fastcc``
+  and the platform C calling convention agree for ``void(ptr)``. It is an ABI
+  break on i686, MIPS O32, PowerPC64 ELFv1, and Lanai.
 
 AST Dumping Potentially Breaking Changes
 ----------------------------------------
