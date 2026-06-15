@@ -221,6 +221,12 @@ Resolutions to C++ Defect Reports
 - Clang now uses non-reference types for structured bindings whose initializer
   returns a prvalue. This resolves `CWG3135 <https://wg21.link/cwg3135>`_.
 
+- A coroutine promise type may now declare both ``return_void`` and
+  ``return_value``. Whether flowing off the end of a coroutine is well-defined
+  is now determined by the viability of ``p.return_void()`` rather than by a
+  name lookup. This implements `P3950R1 <https://wg21.link/p3950r1>`_, applied
+  as a defect report across all language modes (since C++20).
+
 C Language Changes
 ------------------
 

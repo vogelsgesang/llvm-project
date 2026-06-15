@@ -1714,53 +1714,51 @@ bool CoroutineStmtBuilder::makeOnFallthrough() {
   assert(!IsPromiseDependentType &&
          "cannot make statement while the promise type is dependent");
 
-  // [dcl.fct.def.coroutine]/p6
-  // If searches for the names return_void and return_value in the scope of
-  // the promise type each find any declarations, the program is ill-formed.
-  // [Note 1: If return_void is found, flowing off the end of a coroutine is
-  // equivalent to a co_return with no operand. Otherwise, flowing off the end
-  // of a coroutine results in undefined behavior ([stmt.return.coroutine]). —
-  // end note]
-  bool HasRVoid, HasRValue;
-  LookupResult LRVoid =
-      lookupMember(S, "return_void", PromiseRecordDecl, Loc, HasRVoid);
-  LookupResult LRValue =
-      lookupMember(S, "return_value", PromiseRecordDecl, Loc, HasRValue);
+  // [stmt.return.coroutine]/3
+  // If overload resolution for p.return_void() succeeds, flowing off the end
+  // of a coroutine's function-body is equivalent to a co_return with no
+  // operand; otherwise flowing off the end of a coroutine's function-body
+  // results in undefined behavior.
+  //
+  // Note that, per P3950 (a defect report applied to all language modes), a
+  // promise type may declare both return_void and return_value; whether
+  // flowing off the end is well-defined is decided solely by the viability of
+  // p.return_void().
+  bool HasViableReturnVoid;
+  {
+    // Tentatively build p.return_void() with diagnostics suppressed to probe
+    // whether overload resolution succeeds. Note that an inaccessible
+    // return_void is still viable here (access is not part of overload
+    // resolution); the access error is re-emitted below when the implicit
+    // co_return is actually built.
+    Sema::TentativeAnalysisScope Trap(S);
+    ExprResult ReturnVoid =
+        buildPromiseCall(S, Fn.CoroutinePromise, Loc, "return_void", {});
+    HasViableReturnVoid = !ReturnVoid.isInvalid();
+  }
 
   StmtResult Fallthrough;
-  if (HasRVoid && HasRValue) {
-    // FIXME Improve this diagnostic
-    S.Diag(FD.getLocation(),
-           diag::err_coroutine_promise_incompatible_return_functions)
-        << PromiseRecordDecl;
-    S.Diag(LRVoid.getRepresentativeDecl()->getLocation(),
-           diag::note_member_first_declared_here)
-        << LRVoid.getLookupName();
-    S.Diag(LRValue.getRepresentativeDecl()->getLocation(),
-           diag::note_member_first_declared_here)
-        << LRValue.getLookupName();
-    return false;
-  } else if (!HasRVoid && !HasRValue) {
-    // We need to set 'Fallthrough'. Otherwise the other analysis part might
-    // think the coroutine has defined a return_value method. So it might emit
-    // **false** positive warning. e.g.,
-    //
-    //    promise_without_return_func foo() {
-    //        co_await something();
-    //    }
-    //
-    // Then AnalysisBasedWarning would emit a warning about `foo()` lacking a
-    // co_return statements, which isn't correct.
-    Fallthrough = S.ActOnNullStmt(PromiseRecordDecl->getLocation());
-    if (Fallthrough.isInvalid())
-      return false;
-  } else if (HasRVoid) {
+  if (HasViableReturnVoid) {
     Fallthrough = S.BuildCoreturnStmt(FD.getLocation(), nullptr,
                                       /*IsImplicit=*/true);
     Fallthrough = S.ActOnFinishFullStmt(Fallthrough.get());
     if (Fallthrough.isInvalid())
       return false;
+  } else if (!lookupMember(S, "return_value", PromiseRecordDecl, Loc)) {
+    // The promise type defines neither a viable return_void nor a return_value.
+    // We set 'Fallthrough' to a null statement so that other analyses don't
+    // believe the coroutine has a return_value method and emit a **false**
+    // positive warning about a missing co_return. e.g.,
+    //
+    //    promise_without_return_func foo() {
+    //        co_await something();
+    //    }
+    Fallthrough = S.ActOnNullStmt(PromiseRecordDecl->getLocation());
+    if (Fallthrough.isInvalid())
+      return false;
   }
+  // Otherwise (return_value is present but return_void is not viable) we leave
+  // OnFallthrough null so that flowing off the end is diagnosed.
 
   this->OnFallthrough = Fallthrough.get();
   return true;

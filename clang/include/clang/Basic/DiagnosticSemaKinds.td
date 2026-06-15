@@ -8681,8 +8681,6 @@ def warn_ambiguous_suitable_delete_function_found : Warning<
   InGroup<DiagGroup<"ambiguous-delete">>;
 def note_member_declared_here : Note<
   "member %0 declared here">;
-def note_member_first_declared_here : Note<
-  "member %0 first declared here">;
 def warn_bitwise_instead_of_logical : Warning<
   "use of bitwise '%0' with boolean operands">,
   InGroup<BitwiseInsteadOfLogical>, DefaultIgnore;
@@ -12957,8 +12955,6 @@ def err_coroutine_promise_type_incomplete : Error<
 def err_coroutine_type_missing_specialization : Error<
   "this function cannot be a coroutine: missing definition of "
   "specialization %0">;
-def err_coroutine_promise_incompatible_return_functions : Error<
-  "the coroutine promise type %0 declares both 'return_value' and 'return_void'">;
 def note_coroutine_promise_implicit_await_transform_required_here : Note<
   "call to 'await_transform' implicitly required by 'co_await' here">;
 def note_coroutine_promise_suspend_implicitly_required : Note<

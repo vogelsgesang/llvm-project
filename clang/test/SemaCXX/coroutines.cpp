@@ -694,24 +694,59 @@ coro<bad_promise_5> bad_final_suspend() { // expected-error {{no member named 'a
   co_await a; // expected-note {{function is a coroutine due to use of 'co_await' here}}
 }
 
-struct bad_promise_6 {
-  coro<bad_promise_6> get_return_object();
+// Per P3950 (a defect report), a promise type may declare both 'return_void'
+// and 'return_value'. Flowing off the end is well-defined because
+// 'return_void' is viable.
+struct promise_both_return {
+  coro<promise_both_return> get_return_object();
   suspend_always initial_suspend();
   suspend_always final_suspend() noexcept;
   void unhandled_exception();
-  void return_void();           // expected-note 2 {{member 'return_void' first declared here}}
-  void return_value(int) const; // expected-note 2 {{member 'return_value' first declared here}}
+  void return_void();
+  void return_value(int) const;
   void return_value(int);
 };
-coro<bad_promise_6> bad_implicit_return() { // expected-error {{'bad_promise_6' declares both 'return_value' and 'return_void'}}
+coro<promise_both_return> both_implicit_return() {
   co_await a;
+}
+// The headline feature: 'co_return;' and 'co_return v;' may both appear with
+// the same promise type.
+coro<promise_both_return> both_coreturn_void() {
+  co_return;
+}
+coro<promise_both_return> both_coreturn_value() {
+  co_return 1;
 }
 
 template <class T>
-coro<T> bad_implicit_return_dependent(T) { // expected-error {{'bad_promise_6' declares both 'return_value' and 'return_void'}}
+coro<T> both_implicit_return_dependent(T) {
   co_await a;
 }
-template coro<bad_promise_6> bad_implicit_return_dependent(bad_promise_6); // expected-note {{in instantiation}}
+template coro<promise_both_return> both_implicit_return_dependent(promise_both_return);
+
+// P3950 motivating example: a generic promise whose 'return_void' and
+// 'return_value' are mutually exclusive via constraints. Both names are
+// declared, but at most one is viable for a given instantiation. Whether
+// flowing off the end is well-defined is decided by the viability of
+// 'p.return_void()', not by name lookup.
+template <bool ReturnsVoid>
+struct constrained_promise {
+  coro<constrained_promise> get_return_object();
+  suspend_always initial_suspend();
+  suspend_always final_suspend() noexcept;
+  void unhandled_exception();
+  void return_void() requires ReturnsVoid;
+  void return_value(int) requires (!ReturnsVoid);
+};
+// 'return_void' is viable: flowing off the end is equivalent to 'co_return;'.
+coro<constrained_promise<true>> constrained_void_falloff() {
+  co_await a;
+}
+// 'return_void' is not viable: an explicit 'co_return' is required.
+coro<constrained_promise<false>> constrained_value_coreturn() {
+  co_await a;
+  co_return 42;
+}
 
 struct bad_promise_7 { // expected-note 2 {{defined here}}
   coro<bad_promise_7> get_return_object();
@@ -1051,13 +1086,11 @@ struct promise_no_return_func {
   suspend_always final_suspend() noexcept;
   void unhandled_exception();
 };
-// [dcl.fct.def.coroutine]/p6
-// If searches for the names return_­void and return_­value in the scope of
-// the promise type each find any declarations, the program is ill-formed.
-// [Note 1: If return_­void is found, flowing off the end of a coroutine is
-// equivalent to a co_­return with no operand. Otherwise, flowing off the end
-// of a coroutine results in undefined behavior ([stmt.return.coroutine]). —
-// end note]
+// [stmt.return.coroutine]/3
+// If overload resolution for p.return_void() succeeds, flowing off the end of
+// a coroutine's function-body is equivalent to a co_return with no operand;
+// otherwise flowing off the end of a coroutine's function-body results in
+// undefined behavior.
 //
 // So it isn't ill-formed if the promise doesn't define return_value and return_void.
 // It is just a potential UB.
